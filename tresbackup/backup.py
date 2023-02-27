@@ -1,19 +1,24 @@
 # coding=utf-8
 from argparse import ArgumentParser
+from collections import deque
 from dataclasses import dataclass, is_dataclass, asdict
-from json import load, dump, dumps, JSONEncoder
-from logging import Handler, StreamHandler, INFO, Formatter, getLogger, info
+from io import BufferedReader, RawIOBase
+from json import load, dump, dumps, JSONEncoder, loads
+from logging import Handler, StreamHandler, INFO, Formatter, getLogger, info, exception, warning
 from os.path import join
 from re import compile as regexp_compile
 from shutil import move
-from typing import List, Dict, Pattern, Any, Generator
-from zipfile import ZIP_BZIP2
+from typing import List, Dict, Pattern, Any, Generator, Tuple
+from zipfile import ZipFile, ZIP_DEFLATED
 
 from dataclasses_json import dataclass_json
 from elasticsearch import Elasticsearch
 from elasticsearch.client.indices import IndicesClient
-from elasticsearch.helpers import scan
+from elasticsearch.helpers import scan, parallel_bulk
+from ijson import items as stream_ijson
+from stream_unzip import stream_unzip
 from tqdm import tqdm
+# noinspection PyPackageRequirements
 from zipstream import ZipStream
 
 
@@ -126,7 +131,7 @@ def backup(
     fine_settings: Dict[str, Any] = settings[index_name]["settings"]
     backup_file = join(backup_path, "{}-backup.zip".format(index_name))
     backup_tmp_file = backup_file + ".tmp"
-    zs = ZipStream(compress_type=ZIP_BZIP2, compress_level=9)
+    zs = ZipStream(compress_type=ZIP_DEFLATED, compress_level=9)
     with open(backup_tmp_file, mode="wb") as f:
         zs.add(dumps(fine_mapping, indent=2), "mapping.json")
         zs.add(dumps(fine_settings, indent=2), "settings.json")
@@ -138,7 +143,7 @@ def backup(
     IndexMetadata.save_metadata(state, meta_path)
 
 
-def process(
+def process_backup(
     elastic: Elasticsearch,
     prev_state: Dict[str, IndexMetadata],
     curr_state: Dict[str, IndexMetadata],
@@ -163,6 +168,143 @@ def process(
                    batch_size, scroll_time, request_timeout)
 
 
+def iterable_to_stream(iterable, buffer_size=8 * 1024 * 1024):
+    """
+    Lets you use an iterable (e.g. a generator) that yields byte strings as a read-only
+    input stream.
+
+    The stream implements Python 3's newer I/O API (available in Python 2's io module).
+    For efficiency, the stream is buffered.
+    """
+
+    class IterStream(RawIOBase):
+        def __init__(self):
+            self.leftover = None
+
+        # noinspection PyMethodMayBeStatic
+        def readable(self):
+            return True
+
+        def readinto(self, b):
+            try:
+                length = len(b)  # We're supposed to return at most this much
+                chunk = self.leftover or next(iterable)
+                output, self.leftover = chunk[:length], chunk[length:]
+                b[:len(output)] = output
+                return len(output)
+            except StopIteration:
+                return 0  # indicate EOF
+
+    return BufferedReader(IterStream(), buffer_size=buffer_size)
+
+
+def restore(
+    es: Elasticsearch,
+    batch_size: int,
+    threads: int,
+    timeout: int,
+    index_path: str,
+    settings: Dict[str, Any],
+    mapping: Dict[str, Any],
+) -> None:
+    def archive_generator():
+        with open(index_path, mode="rb") as f:
+            while True:
+                data = f.read(8 * 1024 * 1024)
+                if not data:
+                    break
+                yield data
+
+    def docs_generator():
+        for file_name, file_size, unzipped_chunks in stream_unzip(archive_generator()):
+            if file_name in {b"settings.json", b"mapping.json"}:
+                # iterate through generator to skip
+                deque(unzipped_chunks, maxlen=0)
+                continue
+            if file_name == b"docs.json":
+                for chunk in unzipped_chunks:
+                    yield chunk
+            else:
+                warning(f"Unknown file observed: {file_name}, ignore")
+                deque(unzipped_chunks, maxlen=0)
+
+    def es_docs_generator():
+        for doc in stream_ijson(iterable_to_stream(docs_generator(), buffer_size=8 * 1024 * 1024), "item"):
+            doc.pop("_id", "")
+            doc.pop("sort", "")
+            doc.pop("_score", "")
+            doc["_index"] = doc["_index"]
+
+            yield doc
+
+    info("Counting docs...")
+    name = settings["index"]["provided_name"]
+    bar = tqdm(desc=name, total=0)
+    try:
+        for _ in stream_ijson(iterable_to_stream(docs_generator(), buffer_size=8 * 1024 * 1024), "item"):
+            bar.update()
+    finally:
+        bar.close()
+    total = bar.n
+    info(f"Total docs: {total}")
+    index_settings = settings["index"]
+    index_settings.pop("creation_date", None)
+    index_settings.pop("uuid", None)
+    index_settings.pop("version", None)
+    index_settings.pop("provided_name", None)
+    es.indices.create(index=name, body={
+        "settings": settings,
+        "mappings": mapping
+    })
+    bar = tqdm(desc=name, total=total)
+    try:
+        for success, err_info in parallel_bulk(
+            client=es,
+            thread_count=threads,
+            chunk_size=batch_size,
+            actions=es_docs_generator()
+        ):
+            bar.update()
+            if not success:
+                print('A document failed:', err_info)
+    finally:
+        bar.close()
+    info(f"Flush & refresh")
+    es.indices.refresh(index=name, request_timeout=timeout)
+    es.indices.flush(index=name, request_timeout=timeout)
+    info("Done")
+
+
+def process_restore(
+    es: Elasticsearch,
+    batch_size: int,
+    threads: int,
+    timeout: int,
+    indexes: List[str],
+) -> None:
+    info("Checking indexes...")
+    validated: Dict[str, Tuple[Dict[str, Any], Dict[str, Any]]] = {}
+    for index in indexes:
+        # noinspection PyBroadException
+        try:
+            info(f"Checking index {index}...")
+            with ZipFile(index, mode="r") as archive:
+                mapping = loads(archive.read("mapping.json").decode("utf-8"))
+                settings = loads(archive.read("settings.json").decode("utf-8"))
+                name = settings["index"]["provided_name"]
+                info(f"Provided name: {name}")
+                validated[index] = (mapping, settings)
+        except Exception:
+            exception(f"Can't verify index dump {index}")
+
+    for index, (mapping, settings) in validated.items():
+        # noinspection PyBroadException
+        try:
+            restore(es, batch_size, threads, timeout, index, settings, mapping)
+        except Exception:
+            exception(f"Can't process index {index}")
+
+
 def main() -> None:
     console = default_handler()
     getLogger('').addHandler(console)
@@ -171,76 +313,139 @@ def main() -> None:
     getLogger().setLevel(INFO)
 
     parser = ArgumentParser(
-        prog="Elasticsearch backup",
-        description="Makes a backup of all (or specified) indices"
+        prog="tresbackup",
+        description="Makes a backup/restore of all (or specified) indices"
     )
-    parser.add_argument(
+
+    subparsers = parser.add_subparsers(help="sub-command help", dest="command")
+
+    parser_backup = subparsers.add_parser("backup", help="backup help")
+    parser_backup.add_argument(
         "-e", "--es-url", type=str,
         required=True,
         metavar="es_url", dest="es_url",
         help="Elasticsearch url with url-encoded credentials (if required)"
     )
-    parser.add_argument(
+    parser_backup.add_argument(
+        "--insecure", action="store_true",
+        required=False, default=False, dest="insecure",
+        help="Disables HTTPS certificate verification"
+    )
+    parser_backup.add_argument(
         "-b", "--batch-size", type=int,
         required=False, default=1000,
         metavar="batch_size", dest="batch_size",
         help="Elasticsearch batch size (size) parameter to fetch documents"
     )
-    parser.add_argument(
+    parser_backup.add_argument(
         "-s", "--scroll-time", type=str,
         required=False, default="60m",
         metavar="scroll_time", dest="scroll_time",
         help="Elasticsearch scroll time parameter to fetch documents"
     )
-    parser.add_argument(
+    parser_backup.add_argument(
         "-t", "--timeout", type=int,
         required=False, default=60,
         metavar="request_timeout", dest="request_timeout",
         help="Elasticsearch request timeout in seconds"
     )
-    parser.add_argument(
+    parser_backup.add_argument(
         "-i", "--index", type=str,
         required=False,
         nargs="*", action="append",
         metavar="indexes", dest="indexes",
         help="Index(es) to backup. If not specified, all indexes are backed up. ES regexes are supported"
     )
-    parser.add_argument(
+    parser_backup.add_argument(
         "-x", "--exclude", type=str,
         required=False, default="\\..*",
         metavar="exclude", dest="exclude",
         help="Regular expression to exclude indexes. By default skips all indexes start with '.'"
     )
-    parser.add_argument(
+    parser_backup.add_argument(
         "-m", "--meta-file", type=str,
         required=False, default="es-dump-metadata.json",
         metavar="meta_file", dest="meta_file",
         help="Path to metadata file to track indexes changes"
     )
-    parser.add_argument(
+    parser_backup.add_argument(
         "-f", "--force", type=bool,
         required=False, default=False,
         metavar="force", dest="force",
         help="Ignores exising metadata file and creates backup of all specified indexes"
     )
-    parser.add_argument(
+    parser_backup.add_argument(
         "-o", "--output-path", type=str,
         required=False, default=".",
         metavar="output_path", dest="output_path",
         help="Path where backup archives will be stored"
     )
+
+    parser_restore = subparsers.add_parser("restore", help="restore help")
+    parser_restore.add_argument(
+        "-e", "--es-url", type=str,
+        required=True,
+        metavar="es_url", dest="es_url",
+        help="Elasticsearch url with url-encoded credentials (if required)"
+    )
+    parser_restore.add_argument(
+        "--insecure", action="store_true",
+        required=False, default=False, dest="insecure",
+        help="Disables HTTPS certificate verification"
+    )
+    parser_restore.add_argument(
+        "-b", "--batch-size", type=int,
+        required=False, default=1000,
+        metavar="batch_size", dest="batch_size",
+        help="Elasticsearch batch size (size) parameter to index documents"
+    )
+    parser_restore.add_argument(
+        "-p", "--parallel-threads", type=int,
+        required=False, default=16,
+        metavar="threads", dest="threads",
+        help="Parallel threads to index data"
+    )
+    parser_restore.add_argument(
+        "-t", "--timeout", type=int,
+        required=False, default=300,
+        metavar="request_timeout", dest="request_timeout",
+        help="Elasticsearch request timeout in seconds"
+    )
+    parser_restore.add_argument(
+        "-i", "--index", type=str,
+        required=True,
+        nargs="*", action="append",
+        metavar="indexes", dest="indexes",
+        help="Paths to index(es) ZIPs to restore. If not specified, all indexes in current directory are restored."
+    )
     args = parser.parse_args()
-    es_url: str = args.es_url
-    exclude: Pattern = regexp_compile(args.exclude)
-    meta_file: str = args.meta_file
-    output_path: str = args.output_path
-    timeout: int = args.request_timeout
-    es: Elasticsearch = Elasticsearch(es_url)
-    es.cluster.health(request_timeout=timeout)
-    indexes = [j for i in args.indexes or [] for j in i] or ["*"]
-    current_state = list_indexes(es, indexes, exclude, timeout)
-    prev_state = {} if args.force else IndexMetadata.load_metadata(meta_file)
-    process(es, prev_state, current_state, output_path, meta_file, args.batch_size, args.scroll_time, timeout)
+    command: str = args.command
+    if command == "backup":
+        es_url: str = args.es_url
+        insecure: bool = args.insecure
+        exclude: Pattern = regexp_compile(args.exclude)
+        meta_file: str = args.meta_file
+        output_path: str = args.output_path
+        timeout: int = args.request_timeout
+        es: Elasticsearch = Elasticsearch(es_url, verify_certs=not insecure)
+        es.cluster.health(request_timeout=timeout)
+        indexes = [j for i in args.indexes or [] for j in i] or ["*"]
+        current_state = list_indexes(es, indexes, exclude, timeout)
+        prev_state = {} if args.force else IndexMetadata.load_metadata(meta_file)
+        process_backup(es, prev_state, current_state, output_path, meta_file,
+                       args.batch_size, args.scroll_time, timeout)
+    elif command == "restore":
+        es_url: str = args.es_url
+        insecure: bool = args.insecure
+        batch_size: int = args.batch_size
+        threads: int = args.threads
+        timeout: int = args.request_timeout
+        indexes = [j for i in args.indexes or [] for j in i] or ["*"]
+        es: Elasticsearch = Elasticsearch(es_url, verify_certs=not insecure)
+        es.cluster.health(request_timeout=timeout)
+        process_restore(es, batch_size, threads, timeout, indexes)
+    else:
+        raise ValueError(f"Unknown command: {command}")
 
 
 if __name__ == '__main__':

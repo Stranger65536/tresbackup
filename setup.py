@@ -15,8 +15,8 @@ README = (HERE / "README.md").read_text()
 # This call to setup() does all the work
 setup(
     name="tresbackup",
-    version="0.0.1",
-    description="CLI for easy ES backup with simple tracking of non-modified indexes",
+    version="0.0.2",
+    description="CLI for easy ES backup and restore with simple tracking of non-modified indexes",
     long_description=README,
     long_description_content_type="text/markdown",
     url="https://github.com/Stranger65536/tresbackup",
