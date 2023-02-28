@@ -15,7 +15,7 @@ README = (HERE / "README.md").read_text()
 # This call to setup() does all the work
 setup(
     name="tresbackup",
-    version="0.0.2",
+    version="0.0.3",
     description="CLI for easy ES backup and restore with simple tracking of non-modified indexes",
     long_description=README,
     long_description_content_type="text/markdown",
@@ -27,11 +27,11 @@ setup(
         "License :: OSI Approved :: GNU Affero General "
         "Public License v3 or later (AGPLv3+)",
         "Programming Language :: Python :: 3",
-        "Programming Language :: Python :: 3.6",
+        "Programming Language :: Python :: 3.7",
     ],
     packages=find_packages(),
     include_package_data=True,
-    python_requires='>=3.6',
+    python_requires='>=3.7',
     install_requires=INSTALL_REQUIRES,
     entry_points={
         "console_scripts": [

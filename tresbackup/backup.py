@@ -9,7 +9,7 @@ from os.path import join
 from re import compile as regexp_compile
 from shutil import move
 from typing import List, Dict, Pattern, Any, Generator, Tuple
-from zipfile import ZipFile, ZIP_DEFLATED
+from zipfile import ZipFile, ZIP_BZIP2
 
 from dataclasses_json import dataclass_json
 from elasticsearch import Elasticsearch
@@ -105,6 +105,7 @@ def backup(
     batch_size: int,
     scroll_time: str,
     request_timeout: int,
+    compression_level: int,
 ) -> None:
     def es_docs_generator(total_docs: int) -> Generator[Dict[str, Any], None, None]:
         bar = tqdm(desc=index_name, total=total_docs)
@@ -131,7 +132,7 @@ def backup(
     fine_settings: Dict[str, Any] = settings[index_name]["settings"]
     backup_file = join(backup_path, "{}-backup.zip".format(index_name))
     backup_tmp_file = backup_file + ".tmp"
-    zs = ZipStream(compress_type=ZIP_DEFLATED, compress_level=9)
+    zs = ZipStream(compress_type=ZIP_BZIP2, compress_level=compression_level)
     with open(backup_tmp_file, mode="wb") as f:
         zs.add(dumps(fine_mapping, indent=2), "mapping.json")
         zs.add(dumps(fine_settings, indent=2), "settings.json")
@@ -152,6 +153,7 @@ def process_backup(
     batch_size: int,
     scroll_time: str,
     request_timeout: int,
+    compression_level: int,
 ) -> None:
     merged_state = dict(prev_state)
     for index_name, state in curr_state.items():
@@ -165,7 +167,7 @@ def process_backup(
                 info("Index {} doesn't seem to be changed, skip".format(index_name))
         else:
             backup(elastic, index_name, backup_path, meta_path, merged_state, state,
-                   batch_size, scroll_time, request_timeout)
+                   batch_size, scroll_time, request_timeout, compression_level)
 
 
 def iterable_to_stream(iterable, buffer_size=8 * 1024 * 1024):
@@ -338,6 +340,12 @@ def main() -> None:
         help="Elasticsearch batch size (size) parameter to fetch documents"
     )
     parser_backup.add_argument(
+        "-c", "--compression-level", type=int,
+        required=False, default=9, choices=range(1, 10),
+        metavar="compression_level", dest="compression_level",
+        help="Compression level"
+    )
+    parser_backup.add_argument(
         "-s", "--scroll-time", type=str,
         required=False, default="60m",
         metavar="scroll_time", dest="scroll_time",
@@ -427,13 +435,14 @@ def main() -> None:
         meta_file: str = args.meta_file
         output_path: str = args.output_path
         timeout: int = args.request_timeout
+        compression_level: int = args.compression_level
         es: Elasticsearch = Elasticsearch(es_url, verify_certs=not insecure)
         es.cluster.health(request_timeout=timeout)
         indexes = [j for i in args.indexes or [] for j in i] or ["*"]
         current_state = list_indexes(es, indexes, exclude, timeout)
         prev_state = {} if args.force else IndexMetadata.load_metadata(meta_file)
         process_backup(es, prev_state, current_state, output_path, meta_file,
-                       args.batch_size, args.scroll_time, timeout)
+                       args.batch_size, args.scroll_time, timeout, compression_level)
     elif command == "restore":
         es_url: str = args.es_url
         insecure: bool = args.insecure
