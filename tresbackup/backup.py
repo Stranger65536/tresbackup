@@ -162,7 +162,7 @@ def process_backup(
             prev_index_state = prev_state[index_name]
             if prev_index_state != state:
                 backup(elastic, index_name, backup_path, meta_path, merged_state, state,
-                       batch_size, scroll_time, request_timeout)
+                       batch_size, scroll_time, request_timeout, compression_level)
             else:
                 info("Index {} doesn't seem to be changed, skip".format(index_name))
         else:
@@ -230,13 +230,12 @@ def restore(
                 warning(f"Unknown file observed: {file_name}, ignore")
                 deque(unzipped_chunks, maxlen=0)
 
-    def es_docs_generator():
+    def es_docs_generator(index_name: str):
         for doc in stream_ijson(iterable_to_stream(docs_generator(), buffer_size=8 * 1024 * 1024), "item"):
             doc.pop("_id", "")
             doc.pop("sort", "")
             doc.pop("_score", "")
-            doc["_index"] = doc["_index"]
-
+            doc["_index"] = index_name
             yield doc
 
     info("Counting docs...")
@@ -264,7 +263,7 @@ def restore(
             client=es,
             thread_count=threads,
             chunk_size=batch_size,
-            actions=es_docs_generator()
+            actions=es_docs_generator(name)
         ):
             bar.update()
             if not success:
